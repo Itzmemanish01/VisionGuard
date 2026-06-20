@@ -10,7 +10,6 @@ import pandas as pd
 import re
 import plotly.express as px
 
-# ── Page config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="VisionGuard",
     page_icon="🚦",
@@ -18,7 +17,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ── Custom CSS ───────────────────────────────────────────────
 st.markdown("""
 <style>
     body { background-color: #0d0d0d; }
@@ -61,17 +59,41 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Model loading ─────────────────────────────────────────────
 @st.cache_resource
 def load_models():
     helmet = YOLO(r'C:\Users\manis\OneDrive\Desktop\Visionguard\models\runs\detect\visionguard_helmet-4\weights\best.pt')
     plate  = YOLO(r'C:\Users\manis\OneDrive\Desktop\Visionguard\models\runs\detect\visionguard_plate\weights\best.pt')
+    tl     = YOLO(r'C:\Users\manis\OneDrive\Desktop\Visionguard\models\runs\detect\visionguard_traffic_light\weights\best.pt')
     ocr    = easyocr.Reader(['en'], gpu=False)
-    return helmet, plate, ocr
+    return helmet, plate, tl, ocr
 
-helmet_model, plate_model, reader = load_models()
+helmet_model, plate_model, tl_model, reader = load_models()
 
-# ── Logging ───────────────────────────────────────────────────
+def detect_red_light_violation(image):
+    tl_results = tl_model(image)[0]
+    violations = []
+    is_red = False
+
+    for box in tl_results.boxes:
+        if int(box.cls) == 1:  # Red
+            is_red = True
+            break
+
+    if is_red:
+        plate_results = plate_model(image)[0]
+        for box in plate_results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            plate_crop = image[y1:y2, x1:x2]
+            ocr_result = reader.readtext(plate_crop)
+            plate_text = " ".join([r[1] for r in ocr_result]) if ocr_result else "Unreadable"
+            violations.append({
+                "type": "Red Light Violation",
+                "plate": plate_text,
+                "confidence": f"{float(box.conf):.2f}"
+            })
+
+    return violations, is_red
+
 LOG_PATH = 'logs/violations.csv'
 os.makedirs('logs', exist_ok=True)
 
@@ -82,7 +104,6 @@ def log_violation(plate, v_type, confidence):
             plate, v_type, f"{confidence:.1%}"
         ])
 
-# ── OCR helper ────────────────────────────────────────────────
 def read_plate(img, box):
     x1, y1, x2, y2 = map(int, box.xyxy[0])
     crop = img[y1:y2, x1:x2]
@@ -97,30 +118,35 @@ def read_plate(img, box):
         return text if len(text) > 3 else None
     return None
 
-# ── Preprocessing ─────────────────────────────────────────────
 def preprocess(img):
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(l)
     return cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_LAB2BGR)
 
-# ── Triple riding detection ───────────────────────────────────
-def check_triple_riding(boxes, names):
-    # Count all riders (With or Without Helmet = one person on bike)
-    rider_count = sum(1 for box in boxes if names[int(box.cls)] in ['With Helmet', 'Without Helmet'])
-    return rider_count >= 3, rider_count
+def check_triple_riding(boxes, names, img_width):
+    riders = []
+    for box in boxes:
+        if names[int(box.cls)] in ['With Helmet', 'Without Helmet']:
+            x_center = float((box.xyxy[0][0] + box.xyxy[0][2]) / 2)
+            riders.append(x_center)
 
-# ── Header ────────────────────────────────────────────────────
+    if len(riders) < 3:
+        return False, len(riders)
+
+    riders.sort()
+    for i in range(len(riders) - 2):
+        if riders[i+2] - riders[i] < img_width * 0.30:
+            return True, len(riders)
+
+    return False, len(riders)
+
 st.markdown("# 🚦 VisionGuard")
 st.markdown("##### AI-Powered Traffic Violation Detection — Gridlock Hackathon 2.0")
 st.divider()
 
-# ── Tabs ──────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["🔍 Detection", "📊 Analytics", "🎯 Model Performance"])
 
-# ════════════════════════════════════════════════════════════════
-# TAB 1 — Detection
-# ════════════════════════════════════════════════════════════════
 with tab1:
     uploaded = st.file_uploader("Upload a traffic image", type=['jpg','jpeg','png'])
 
@@ -133,12 +159,10 @@ with tab1:
             helmet_results = helmet_model(img)
             plate_results  = plate_model(img)
 
-            # Plates
             plates = [read_plate(img, box) for box in plate_results[0].boxes]
             plates = [p for p in plates if p]
             plate_str = plates[0] if plates else "Unknown"
 
-            # Helmet violations
             violations = []
             for box in helmet_results[0].boxes:
                 label = helmet_results[0].names[int(box.cls)]
@@ -147,24 +171,28 @@ with tab1:
                     violations.append((label, conf))
                     log_violation(plate_str, 'No Helmet', conf)
 
-            # Triple riding
             is_triple, rider_count = check_triple_riding(
                 helmet_results[0].boxes,
-                helmet_results[0].names
+                helmet_results[0].names,
+                img.shape[1]
             )
             if is_triple:
                 log_violation(plate_str, 'Triple Riding', 0.95)
 
-        # Results layout
+            # Red light detection
+            tl_violations, is_red = detect_red_light_violation(img)
+            if is_red:
+                for v in tl_violations:
+                    log_violation(v['plate'], 'Red Light Violation', float(v['confidence']))
+
         col1, col2 = st.columns([2, 1])
 
         with col1:
             annotated = helmet_results[0].plot()
-            st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_column_width=True)
+            st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width=800)
 
         with col2:
-            total_violations = len(violations) + (1 if is_triple else 0)
-
+            total_violations = len(violations) + (1 if is_triple else 0) + (1 if is_red else 0)
             st.markdown(f"""
             <div class="metric-box">
                 <h2 style="color:{'#FF4B4B' if total_violations else '#00CC66'}">
@@ -176,7 +204,6 @@ with tab1:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Plates
             if plates:
                 for p in plates:
                     st.markdown(f'<div class="plate-tag">🪪 {p}</div>', unsafe_allow_html=True)
@@ -185,7 +212,6 @@ with tab1:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Helmet violations with confidence
             if violations:
                 for label, conf in violations:
                     st.markdown(
@@ -195,22 +221,27 @@ with tab1:
             else:
                 st.success("No helmet violations")
 
-            # Triple riding flag
             if is_triple:
                 st.markdown(
                     f'<div class="violation-tag">⚠️ Triple Riding — {rider_count} riders detected</div>',
                     unsafe_allow_html=True
                 )
 
-# ════════════════════════════════════════════════════════════════
-# TAB 2 — Analytics
-# ════════════════════════════════════════════════════════════════
+            if is_red:
+                plate_info = tl_violations[0]['plate'] if tl_violations else "Unknown"
+                st.markdown(
+                    f'<div class="violation-tag">🔴 Red Light Violation — Plate: {plate_info}</div>',
+                    unsafe_allow_html=True
+                )
+
 with tab2:
+    if st.button("Clear Logs"):
+        open(LOG_PATH, 'w').close()
+    st.success("Logs cleared.")
     try:
         df = pd.read_csv(LOG_PATH, names=['Time','Plate','Violation','Confidence'])
         df['Time'] = pd.to_datetime(df['Time'])
 
-        # Summary metrics
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Violations", len(df))
         c2.metric("Unique Plates",    df['Plate'].nunique())
@@ -248,25 +279,19 @@ with tab2:
             use_container_width=True
         )
 
-    except Exception as e:
+    except Exception:
         st.info("No violations logged yet. Upload an image in the Detection tab.")
 
-# ════════════════════════════════════════════════════════════════
-# TAB 3 — Model Performance
-# ════════════════════════════════════════════════════════════════
 with tab3:
-    st.markdown("### Helmet Detection Model — YOLOv8n")
+    st.markdown("### 🪖 Helmet Detection Model — YOLOv8n")
     st.caption("Fine-tuned on Indian traffic dataset | 30 epochs | RTX 2050")
-
     c1, c2, c3, c4 = st.columns(4)
     c1.markdown('<div class="perf-box"><h3>90.2%</h3><p>mAP50</p></div>', unsafe_allow_html=True)
     c2.markdown('<div class="perf-box"><h3>90.0%</h3><p>Precision</p></div>', unsafe_allow_html=True)
     c3.markdown('<div class="perf-box"><h3>83.1%</h3><p>Recall</p></div>', unsafe_allow_html=True)
     c4.markdown('<div class="perf-box"><h3>53.3%</h3><p>mAP50-95</p></div>', unsafe_allow_html=True)
-
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("**Per-Class Breakdown**")
-
     perf_df = pd.DataFrame({
         'Class':     ['With Helmet', 'Without Helmet'],
         'Precision': [0.933, 0.867],
@@ -274,7 +299,6 @@ with tab3:
         'mAP50':     [0.940, 0.865]
     })
     st.dataframe(perf_df, use_container_width=True, hide_index=True)
-
     fig3 = px.bar(
         perf_df.melt(id_vars='Class', var_name='Metric', value_name='Score'),
         x='Metric', y='Score', color='Class', barmode='group',
@@ -283,3 +307,40 @@ with tab3:
     )
     fig3.update_yaxes(range=[0,1])
     st.plotly_chart(fig3, use_container_width=True)
+
+    st.divider()
+
+    st.markdown("### 🪪 License Plate Detection Model — YOLOv8n")
+    st.caption("Trained on Indian license plate dataset | 30 epochs | RTX 2050")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown('<div class="perf-box"><h3>99.5%</h3><p>mAP50</p></div>', unsafe_allow_html=True)
+    c2.markdown('<div class="perf-box"><h3>98.7%</h3><p>Precision</p></div>', unsafe_allow_html=True)
+    c3.markdown('<div class="perf-box"><h3>99.4%</h3><p>Recall</p></div>', unsafe_allow_html=True)
+    c4.markdown('<div class="perf-box"><h3>84.2%</h3><p>mAP50-95</p></div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    st.markdown("### 🚦 Traffic Light Detection Model — YOLOv8n")
+    st.caption("Trained on traffic light dataset (Red/Green/Yellow) | 30 epochs | RTX 2050")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown('<div class="perf-box"><h3>96.6%</h3><p>mAP50</p></div>', unsafe_allow_html=True)
+    c2.markdown('<div class="perf-box"><h3>94.9%</h3><p>Precision</p></div>', unsafe_allow_html=True)
+    c3.markdown('<div class="perf-box"><h3>90.3%</h3><p>Recall</p></div>', unsafe_allow_html=True)
+    c4.markdown('<div class="perf-box"><h3>71.8%</h3><p>mAP50-95</p></div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("**Per-Class Breakdown**")
+    tl_df = pd.DataFrame({
+        'Class':     ['Green', 'Red', 'Yellow'],
+        'Precision': [0.949, 0.952, 0.946],
+        'Recall':    [0.901, 0.908, 0.900],
+        'mAP50':     [0.968, 0.971, 0.958]
+    })
+    st.dataframe(tl_df, use_container_width=True, hide_index=True)
+    fig4 = px.bar(
+        tl_df.melt(id_vars='Class', var_name='Metric', value_name='Score'),
+        x='Metric', y='Score', color='Class', barmode='group',
+        template='plotly_dark',
+        color_discrete_sequence=['#00CC66','#FF4B4B','#FFD700']
+    )
+    fig4.update_yaxes(range=[0,1])
+    st.plotly_chart(fig4, use_container_width=True)

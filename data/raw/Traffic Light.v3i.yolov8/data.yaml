@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['Green', 'Red', 'Yellow']
+
+roboflow:
+  workspace: student-esos5
+  project: traffic-light-v9orl
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/student-esos5/traffic-light-v9orl/dataset/3
